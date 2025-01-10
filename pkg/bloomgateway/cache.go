@@ -3,17 +3,15 @@ package bloomgateway
 import (
 	"context"
 	"flag"
-	"sort"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/common/model"
-	"golang.org/x/exp/slices"
 	"google.golang.org/grpc"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/storage/chunk/cache"
-	"github.com/grafana/loki/pkg/storage/chunk/cache/resultscache"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache/resultscache"
 )
 
 const (
@@ -46,6 +44,7 @@ func newCacheKeyGen(limits CacheLimits) keyGen {
 	return keyGen{limits}
 }
 
+// TODO(owen-d): need to implement our own key-generation which accounts for fingerprint ranges requested.
 func (k keyGen) GenerateCacheKey(ctx context.Context, tenant string, r resultscache.Request) string {
 	return resultscache.ConstSplitter(k.BloomGatewayCacheKeyInterval(tenant)).GenerateCacheKey(ctx, tenant, r)
 }
@@ -73,6 +72,7 @@ func (e extractor) Extract(start, end int64, r resultscache.Response, _, _ int64
 		if len(refs) > 0 {
 			chunkRefs = append(chunkRefs, &logproto.GroupedChunkRefs{
 				Fingerprint: chunkRef.Fingerprint,
+				Labels:      chunkRef.Labels,
 				Tenant:      chunkRef.Tenant,
 				Refs:        refs,
 			})
@@ -94,62 +94,26 @@ func newMerger() merger {
 // We merge all chunks grouped by their fingerprint.
 func (m merger) MergeResponse(responses ...resultscache.Response) (resultscache.Response, error) {
 	var size int
+
+	unmerged := make([][]*logproto.GroupedChunkRefs, 0, len(responses))
 	for _, r := range responses {
 		res := r.(*logproto.FilterChunkRefResponse)
+		unmerged = append(unmerged, res.ChunkRefs)
 		size += len(res.ChunkRefs)
 	}
 
-	chunkRefs := make([]*logproto.GroupedChunkRefs, 0, size)
-	for _, r := range responses {
-		res := r.(*logproto.FilterChunkRefResponse)
-		chunkRefs = append(chunkRefs, res.ChunkRefs...)
+	buf := make([]*logproto.GroupedChunkRefs, 0, size)
+	deduped, err := mergeSeries(unmerged, buf)
+	if err != nil {
+		return nil, err
 	}
 
-	return &logproto.FilterChunkRefResponse{
-		ChunkRefs: mergeGroupedChunkRefs(chunkRefs),
-	}, nil
-}
-
-// Merge duplicated fingerprints by:
-// 1. Sort the chunkRefs by their stream fingerprint
-// 2. Remove duplicated FPs appending all chunks into the first fingerprint's chunk list.
-func mergeGroupedChunkRefs(chunkRefs []*logproto.GroupedChunkRefs) []*logproto.GroupedChunkRefs {
-	if len(chunkRefs) <= 1 {
-		return chunkRefs
-	}
-
-	sort.Slice(chunkRefs, func(i, j int) bool {
-		return chunkRefs[i].Fingerprint < chunkRefs[j].Fingerprint
-	})
-
-	var lastDiffFP int
-	for i := 1; i < len(chunkRefs); i++ {
-		if chunkRefs[lastDiffFP].Fingerprint == chunkRefs[i].Fingerprint {
-			chunkRefs[lastDiffFP].Refs = mergeShortRefs(append(chunkRefs[lastDiffFP].Refs, chunkRefs[i].Refs...))
-		} else {
-			lastDiffFP++
-			chunkRefs[lastDiffFP] = chunkRefs[i]
-		}
-	}
-	return chunkRefs[:lastDiffFP+1]
-}
-
-// mergeShortRefs merges short-refs by removing duplicated checksums.
-func mergeShortRefs(refs []*logproto.ShortRef) []*logproto.ShortRef {
-	if len(refs) <= 1 {
-		return refs
-	}
-
-	sort.Slice(refs, func(i, j int) bool {
-		return refs[i].Checksum < refs[j].Checksum
-	})
-	return slices.CompactFunc(refs, func(a, b *logproto.ShortRef) bool {
-		return a.Checksum == b.Checksum
-	})
+	return &logproto.FilterChunkRefResponse{ChunkRefs: deduped}, nil
 }
 
 type ClientCache struct {
 	cache  *resultscache.ResultsCache
+	next   logproto.BloomGatewayClient
 	limits CacheLimits
 	logger log.Logger
 }
@@ -186,12 +150,19 @@ func NewBloomGatewayClientCacheMiddleware(
 	)
 
 	return &ClientCache{
+		next:   next,
 		cache:  resultsCache,
 		limits: limits,
 		logger: logger,
 	}
 }
 
+// PrefetchBloomBlocks implements logproto.BloomGatewayClient.
+func (c *ClientCache) PrefetchBloomBlocks(ctx context.Context, in *logproto.PrefetchBloomBlocksRequest, opts ...grpc.CallOption) (*logproto.PrefetchBloomBlocksResponse, error) {
+	return c.next.PrefetchBloomBlocks(ctx, in, opts...)
+}
+
+// FilterChunkRefs implements logproto.BloomGatewayClient.
 func (c *ClientCache) FilterChunkRefs(ctx context.Context, req *logproto.FilterChunkRefRequest, opts ...grpc.CallOption) (*logproto.FilterChunkRefResponse, error) {
 	cacheReq := requestWithGrpcCallOptions{
 		FilterChunkRefRequest: req,

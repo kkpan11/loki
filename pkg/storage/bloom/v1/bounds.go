@@ -3,12 +3,15 @@ package v1
 import (
 	"fmt"
 	"hash"
+	"math"
 	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 
-	"github.com/grafana/loki/pkg/util/encoding"
+	iter "github.com/grafana/loki/v3/pkg/iter/v2"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/util/encoding"
 )
 
 type BoundsCheck uint8
@@ -18,6 +21,23 @@ const (
 	Overlap
 	After
 )
+
+var (
+	// FullBounds is the bounds that covers the entire fingerprint space
+	FullBounds = NewBounds(0, model.Fingerprint(math.MaxUint64))
+)
+
+type FingerprintBounds struct {
+	Min, Max model.Fingerprint
+}
+
+// Proto compat
+// compiler check ensuring equal repr of underlying types
+var _ FingerprintBounds = FingerprintBounds(logproto.FPBounds{})
+
+func BoundsFromProto(pb logproto.FPBounds) FingerprintBounds {
+	return FingerprintBounds(pb)
+}
 
 // ParseBoundsFromAddr parses a fingerprint bounds from a string
 func ParseBoundsFromAddr(s string) (FingerprintBounds, error) {
@@ -37,10 +57,6 @@ func ParseBoundsFromParts(a, b string) (FingerprintBounds, error) {
 	}
 
 	return NewBounds(minFingerprint, maxFingerprint), nil
-}
-
-type FingerprintBounds struct {
-	Min, Max model.Fingerprint
 }
 
 func NewBounds(min, max model.Fingerprint) FingerprintBounds {
@@ -90,8 +106,16 @@ func (b FingerprintBounds) Match(fp model.Fingerprint) bool {
 	return b.Cmp(fp) == Overlap
 }
 
-// GetFromThrough implements TSDBs FingerprintFilter interface
+// GetFromThrough implements TSDBs FingerprintFilter interface,
+// NB(owen-d): adjusts to return `[from,through)` instead of `[from,through]` which the
+// fingerprint bounds struct tracks.
 func (b FingerprintBounds) GetFromThrough() (model.Fingerprint, model.Fingerprint) {
+	from, through := b.Bounds()
+	return from, max(through+1, through)
+}
+
+// Bounds returns the inclusive bounds [from,through]
+func (b FingerprintBounds) Bounds() (model.Fingerprint, model.Fingerprint) {
 	return b.Min, b.Max
 }
 
@@ -125,10 +149,21 @@ func (b FingerprintBounds) Intersection(target FingerprintBounds) *FingerprintBo
 // Union returns the union of the two bounds
 func (b FingerprintBounds) Union(target FingerprintBounds) (res []FingerprintBounds) {
 	if !b.Overlaps(target) {
-		if b.Less(target) {
-			return []FingerprintBounds{b, target}
+		if target.Less(b) {
+			b, target = target, b
 		}
-		return []FingerprintBounds{target, b}
+
+		// special case: if the bounds are contiguous, merge them
+		if b.Max+1 == target.Min {
+			return []FingerprintBounds{
+				{
+					Min: min(b.Min, target.Min),
+					Max: max(b.Max, target.Max),
+				},
+			}
+		}
+
+		return []FingerprintBounds{b, target}
 	}
 
 	return []FingerprintBounds{
@@ -158,15 +193,20 @@ func (b FingerprintBounds) Unless(target FingerprintBounds) (res []FingerprintBo
 	return res
 }
 
+// Range returns the number of fingerprints in the bounds
+func (b FingerprintBounds) Range() uint64 {
+	return uint64(b.Max - b.Min)
+}
+
 // unused, but illustrative
 type BoundedIter[V any] struct {
-	Iterator[V]
+	iter.Iterator[V]
 	cmp func(V) BoundsCheck
 }
 
 func (bi *BoundedIter[V]) Next() bool {
 	for bi.Iterator.Next() {
-		switch bi.cmp(bi.Iterator.At()) {
+		switch bi.cmp(bi.At()) {
 		case Before:
 			continue
 		case After:
@@ -178,6 +218,6 @@ func (bi *BoundedIter[V]) Next() bool {
 	return false
 }
 
-func NewBoundedIter[V any](itr Iterator[V], cmp func(V) BoundsCheck) *BoundedIter[V] {
+func NewBoundedIter[V any](itr iter.Iterator[V], cmp func(V) BoundsCheck) *BoundedIter[V] {
 	return &BoundedIter[V]{Iterator: itr, cmp: cmp}
 }

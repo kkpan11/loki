@@ -52,6 +52,10 @@
       // cores and will result in scheduling delays.
       concurrency: 4,
 
+      // use_no_constraints is false by default allowing either TopologySpreadConstraints or pod antiAffinity to be configured.
+      // If no_schedule_constraints is set to true, neither of the pod constraints will be applied.
+      no_schedule_constraints: false,
+
       // If use_topology_spread is true, queriers can run on nodes already running queriers but will be
       // spread through the available nodes using a TopologySpreadConstraints with a max skew
       // of topology_spread_max_skew.
@@ -256,7 +260,34 @@
           interface_names: ['eth0'],
         },
       },
+      pattern_ingester: {
+        enabled: $._config.pattern_ingester.enabled,
+        lifecycler: {
+          ring: {
+            heartbeat_timeout: '1m',
+            replication_factor: 1,
+            kvstore: if $._config.memberlist_ring_enabled then {} else {
+              store: 'consul',
+              consul: {
+                host: 'consul.%s.svc.cluster.local:8500' % $._config.namespace,
+                http_client_timeout: '20s',
+                consistent_reads: true,
+              },
+            },
+          },
 
+          num_tokens: 512,
+          heartbeat_period: '5s',
+          join_after: '30s',
+          interface_names: ['eth0'],
+        },
+        client_config: {
+          grpc_client_config: {
+            max_recv_msg_size: 1024 * 1024 * 64,
+          },
+          remote_timeout: '1s',
+        },
+      },
       ingester_client: {
         grpc_client_config: {
           max_recv_msg_size: 1024 * 1024 * 64,

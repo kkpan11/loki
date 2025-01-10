@@ -3,6 +3,7 @@ package queryrange
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,15 +13,19 @@ import (
 	"github.com/grafana/dskit/user"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql"
-	"github.com/grafana/loki/pkg/logql/syntax"
-	"github.com/grafana/loki/pkg/logqlmodel"
-	"github.com/grafana/loki/pkg/logqlmodel/stats"
-	"github.com/grafana/loki/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
+	"github.com/grafana/loki/v3/pkg/querier/plan"
+	"github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache/resultscache"
+	"github.com/grafana/loki/v3/pkg/storage/stores/shipper/indexshipper/tsdb/index"
 )
 
 func testSampleStreams() []queryrangebase.SampleStream {
@@ -233,6 +238,7 @@ func TestInstanceFor(t *testing.T) {
 			logproto.BACKWARD,
 			1000,
 			nil,
+			nil,
 		)
 		require.NoError(t, err)
 		return params
@@ -288,7 +294,7 @@ func TestInstanceFor(t *testing.T) {
 				Params: logql.ParamsWithShardsOverride{
 					Params: newParams(),
 					ShardsOverride: logql.Shards{
-						{Shard: 0, Of: 2},
+						logql.NewPowerOfTwoShard(index.ShardAnnotation{Shard: 0, Of: 2}),
 					}.Encode(),
 				},
 			},
@@ -296,7 +302,7 @@ func TestInstanceFor(t *testing.T) {
 				Params: logql.ParamsWithShardsOverride{
 					Params: newParams(),
 					ShardsOverride: logql.Shards{
-						{Shard: 1, Of: 2},
+						logql.NewPowerOfTwoShard(index.ShardAnnotation{Shard: 1, Of: 2}),
 					}.Encode(),
 				},
 			},
@@ -324,72 +330,225 @@ func TestInstanceFor(t *testing.T) {
 	ensureParallelism(t, in, in.parallelism)
 }
 
-func TestInstanceDownstream(t *testing.T) {
-	params, err := logql.NewLiteralParams(
-		`{foo="bar"}`,
-		time.Now(),
-		time.Now(),
-		0,
-		0,
-		logproto.BACKWARD,
-		1000,
-		nil,
-	)
-	require.NoError(t, err)
-	expr, err := syntax.ParseExpr(`{foo="bar"}`)
-	require.NoError(t, err)
+func TestParamsToLokiRequest(t *testing.T) {
+	// Usually, queryrangebase.Request converted into Params and passed to downstream engine
+	// And converted back to queryrangebase.Request from the params before executing those queries.
+	// This test makes sure, we don't loose `CachingOption` during this transformation.
 
-	expectedResp := func() *LokiResponse {
-		return &LokiResponse{
-			Data: LokiData{
-				Result: []logproto.Stream{{
-					Labels: `{foo="bar"}`,
-					Entries: []logproto.Entry{
-						{Timestamp: time.Unix(0, 0), Line: "foo"},
-					},
-				}},
+	ts := time.Now()
+	qs := `sum(rate({foo="bar"}[2h] offset 1h))`
+
+	cases := []struct {
+		name    string
+		caching resultscache.CachingOptions
+		expReq  queryrangebase.Request
+	}{
+		{
+			"instant-query-cache-enabled",
+			resultscache.CachingOptions{
+				Disabled: false,
 			},
-			Statistics: stats.Result{
-				Summary: stats.Summary{QueueTime: 1, ExecTime: 2},
+			&LokiInstantRequest{
+				Query:       qs,
+				Limit:       1000,
+				TimeTs:      ts,
+				Direction:   logproto.BACKWARD,
+				Path:        "/loki/api/v1/query",
+				Shards:      nil,
+				StoreChunks: nil,
+				Plan: &plan.QueryPlan{
+					AST: syntax.MustParseExpr(qs),
+				},
+				CachingOptions: resultscache.CachingOptions{
+					Disabled: false,
+				},
+			},
+		},
+		{
+			"instant-query-cache-disabled",
+			resultscache.CachingOptions{
+				Disabled: true,
+			},
+			&LokiInstantRequest{
+				Query:       qs,
+				Limit:       1000,
+				TimeTs:      ts,
+				Direction:   logproto.BACKWARD,
+				Path:        "/loki/api/v1/query",
+				Shards:      nil,
+				StoreChunks: nil,
+				Plan: &plan.QueryPlan{
+					AST: syntax.MustParseExpr(qs),
+				},
+				CachingOptions: resultscache.CachingOptions{
+					Disabled: true,
+				},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			params, err := logql.NewLiteralParamsWithCaching(
+				`sum(rate({foo="bar"}[2h] offset 1h))`,
+				ts,
+				ts,
+				0,
+				0,
+				logproto.BACKWARD,
+				1000,
+				nil,
+				nil,
+				tc.caching,
+			)
+			require.NoError(t, err)
+			req := ParamsToLokiRequest(params)
+			require.Equal(t, tc.expReq, req)
+		})
+	}
+}
+
+func TestInstanceDownstream(t *testing.T) {
+	t.Run("Downstream simple query", func(t *testing.T) {
+		ts := time.Unix(1, 0)
+
+		params, err := logql.NewLiteralParams(
+			`{foo="bar"}`,
+			ts,
+			ts,
+			0,
+			0,
+			logproto.BACKWARD,
+			1000,
+			nil,
+			nil,
+		)
+		require.NoError(t, err)
+		expr, err := syntax.ParseExpr(`{foo="bar"}`)
+		require.NoError(t, err)
+
+		expectedResp := func() *LokiResponse {
+			return &LokiResponse{
+				Data: LokiData{
+					Result: []logproto.Stream{{
+						Labels: `{foo="bar"}`,
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(0, 0), Line: "foo"},
+						},
+					}},
+				},
+				Statistics: stats.Result{
+					Summary: stats.Summary{QueueTime: 1, ExecTime: 2},
+				},
+			}
+		}
+
+		queries := []logql.DownstreamQuery{
+			{
+				Params: logql.ParamsWithShardsOverride{
+					Params: logql.ParamsWithExpressionOverride{Params: params, ExpressionOverride: expr},
+					ShardsOverride: logql.Shards{
+						logql.NewPowerOfTwoShard(index.ShardAnnotation{Shard: 0, Of: 2}),
+					}.Encode(),
+				},
 			},
 		}
-	}
 
-	queries := []logql.DownstreamQuery{
-		{
-			Params: logql.ParamsWithShardsOverride{
-				Params:         logql.ParamsWithExpressionOverride{Params: params, ExpressionOverride: expr},
-				ShardsOverride: logql.Shards{{Shard: 0, Of: 2}}.Encode(),
+		var got queryrangebase.Request
+		var want queryrangebase.Request
+		handler := queryrangebase.HandlerFunc(
+			func(_ context.Context, req queryrangebase.Request) (queryrangebase.Response, error) {
+				// for some reason these seemingly can't be checked in their own goroutines,
+				// so we assign them to scoped variables for later comparison.
+				got = req
+				want = ParamsToLokiRequest(queries[0].Params).WithQuery(expr.String())
+
+				return expectedResp(), nil
 			},
-		},
-	}
+		)
 
-	var got queryrangebase.Request
-	var want queryrangebase.Request
-	handler := queryrangebase.HandlerFunc(
-		func(_ context.Context, req queryrangebase.Request) (queryrangebase.Response, error) {
-			// for some reason these seemingly can't be checked in their own goroutines,
-			// so we assign them to scoped variables for later comparison.
-			got = req
-			want = ParamsToLokiRequest(queries[0].Params).WithQuery(expr.String())
+		expected, err := ResponseToResult(expectedResp())
+		require.Nil(t, err)
 
-			return expectedResp(), nil
-		},
-	)
+		results, err := DownstreamHandler{
+			limits: fakeLimits{},
+			next:   handler,
+		}.Downstreamer(context.Background()).Downstream(context.Background(), queries, logql.NewBufferedAccumulator(len(queries)))
 
-	expected, err := ResponseToResult(expectedResp())
-	require.Nil(t, err)
+		fmt.Println("want", want.GetEnd(), want.GetStart(), "got", got.GetEnd(), got.GetStart())
+		require.Equal(t, want, got)
+		require.Nil(t, err)
+		require.Equal(t, 1, len(results))
+		require.Equal(t, expected.Data, results[0].Data)
+	})
 
-	results, err := DownstreamHandler{
-		limits: fakeLimits{},
-		next:   handler,
-	}.Downstreamer(context.Background()).Downstream(context.Background(), queries, logql.NewBufferedAccumulator(len(queries)))
+	t.Run("Downstream with offset removed", func(t *testing.T) {
+		ts := time.Unix(1, 0)
 
-	require.Equal(t, want, got)
+		params, err := logql.NewLiteralParams(
+			`sum(rate({foo="bar"}[2h] offset 1h))`,
+			ts,
+			ts,
+			0,
+			0,
+			logproto.BACKWARD,
+			1000,
+			nil,
+			nil,
+		)
+		require.NoError(t, err)
 
-	require.Nil(t, err)
-	require.Equal(t, 1, len(results))
-	require.Equal(t, expected.Data, results[0].Data)
+		expectedResp := func() *LokiResponse {
+			return &LokiResponse{
+				Data: LokiData{
+					Result: []logproto.Stream{{
+						Labels: `{foo="bar"}`,
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(0, 0), Line: "foo"},
+						},
+					}},
+				},
+				Statistics: stats.Result{
+					Summary: stats.Summary{QueueTime: 1, ExecTime: 2},
+				},
+			}
+		}
+
+		queries := []logql.DownstreamQuery{
+			{
+				Params: params,
+			},
+		}
+
+		var got queryrangebase.Request
+		var want queryrangebase.Request
+		handler := queryrangebase.HandlerFunc(
+			func(_ context.Context, req queryrangebase.Request) (queryrangebase.Response, error) {
+				// for some reason these seemingly can't be checked in their own goroutines,
+				// so we assign them to scoped variables for later comparison.
+				got = req
+				want = ParamsToLokiRequest(params).WithQuery(`sum(rate({foo="bar"}[2h]))`).WithStartEnd(ts.Add(-1*time.Hour), ts.Add(-1*time.Hour)) // without offset and start, end adjusted for instant query
+
+				return expectedResp(), nil
+			},
+		)
+
+		expected, err := ResponseToResult(expectedResp())
+		require.NoError(t, err)
+
+		results, err := DownstreamHandler{
+			limits:     fakeLimits{},
+			next:       handler,
+			splitAlign: true,
+		}.Downstreamer(context.Background()).Downstream(context.Background(), queries, logql.NewBufferedAccumulator(len(queries)))
+
+		assert.Equal(t, want, got)
+
+		require.Nil(t, err)
+		require.Equal(t, 1, len(results))
+		require.Equal(t, expected.Data, results[0].Data)
+
+	})
 }
 
 func TestCancelWhileWaitingResponse(t *testing.T) {

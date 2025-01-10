@@ -11,12 +11,12 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql/sketch"
-	"github.com/grafana/loki/pkg/logqlmodel"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/sketch"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
 )
 
-func TestProbabilisticMQuantileMatrixSerialization(t *testing.T) {
+func TestProbabilisticQuantileMatrixSerialization(t *testing.T) {
 	emptySketch := sketch.NewDDSketch()
 	ddsketchBytes := make([]byte, 0)
 	emptySketch.Encode(&ddsketchBytes, false)
@@ -113,7 +113,6 @@ func (e errorStepEvaluator) Error() error {
 func (e errorStepEvaluator) Explain(Node) {}
 
 func BenchmarkJoinQuantileSketchVector(b *testing.B) {
-
 	selRange := (5 * time.Second).Nanoseconds()
 	step := (30 * time.Second)
 	offset := int64(0)
@@ -148,7 +147,9 @@ func BenchmarkQuantileBatchRangeVectorIteratorAt(b *testing.B) {
 	}{
 		{numberSamples: 1},
 		{numberSamples: 1_000},
+		{numberSamples: 10_000},
 		{numberSamples: 100_000},
+		{numberSamples: 1_000_000},
 	} {
 		b.Run(fmt.Sprintf("%d-samples", tc.numberSamples), func(b *testing.B) {
 			r := rand.New(rand.NewSource(42))

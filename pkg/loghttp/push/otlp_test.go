@@ -1,23 +1,44 @@
 package push
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/go-kit/log"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grafana/loki/pkg/push"
+
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 func TestOTLPToLokiPushRequest(t *testing.T) {
 	now := time.Unix(0, time.Now().UnixNano())
+	defaultServiceDetection := []string{
+		"service",
+		"app",
+		"application",
+		"name",
+		"app_kubernetes_io_name",
+		"container",
+		"container_name",
+		"k8s_container_name",
+		"component",
+		"workload",
+		"job",
+		"k8s_job_name",
+	}
 
 	for _, tc := range []struct {
 		name                string
@@ -33,7 +54,7 @@ func TestOTLPToLokiPushRequest(t *testing.T) {
 			},
 			expectedPushRequest: logproto.PushRequest{},
 			expectedStats:       *newPushStats(),
-			otlpConfig:          DefaultOTLPConfig,
+			otlpConfig:          DefaultOTLPConfig(defaultGlobalOTLPConfig),
 		},
 		{
 			name: "resource with no logs",
@@ -44,11 +65,11 @@ func TestOTLPToLokiPushRequest(t *testing.T) {
 			},
 			expectedPushRequest: logproto.PushRequest{},
 			expectedStats:       *newPushStats(),
-			otlpConfig:          DefaultOTLPConfig,
+			otlpConfig:          DefaultOTLPConfig(defaultGlobalOTLPConfig),
 		},
 		{
 			name:       "resource with a log entry",
-			otlpConfig: DefaultOTLPConfig,
+			otlpConfig: DefaultOTLPConfig(defaultGlobalOTLPConfig),
 			generateLogs: func() plog.Logs {
 				ld := plog.NewLogs()
 				ld.ResourceLogs().AppendEmpty().Resource().Attributes().PutStr("service.name", "service-1")
@@ -71,20 +92,23 @@ func TestOTLPToLokiPushRequest(t *testing.T) {
 				},
 			},
 			expectedStats: Stats{
-				numLines: 1,
-				logLinesBytes: map[time.Duration]int64{
+				NumLines: 1,
+				LogLinesBytes: map[time.Duration]int64{
 					time.Hour: 9,
 				},
-				structuredMetadataBytes: map[time.Duration]int64{
+				StructuredMetadataBytes: map[time.Duration]int64{
 					time.Hour: 0,
 				},
-				streamLabelsSize:         21,
-				mostRecentEntryTimestamp: now,
+				ResourceAndSourceMetadataLabels: map[time.Duration]push.LabelsAdapter{
+					time.Hour: nil,
+				},
+				StreamLabelsSize:         21,
+				MostRecentEntryTimestamp: now,
 			},
 		},
 		{
 			name:       "no resource attributes defined",
-			otlpConfig: DefaultOTLPConfig,
+			otlpConfig: DefaultOTLPConfig(defaultGlobalOTLPConfig),
 			generateLogs: func() plog.Logs {
 				ld := plog.NewLogs()
 				ld.ResourceLogs().AppendEmpty()
@@ -107,20 +131,23 @@ func TestOTLPToLokiPushRequest(t *testing.T) {
 				},
 			},
 			expectedStats: Stats{
-				numLines: 1,
-				logLinesBytes: map[time.Duration]int64{
+				NumLines: 1,
+				LogLinesBytes: map[time.Duration]int64{
 					time.Hour: 9,
 				},
-				structuredMetadataBytes: map[time.Duration]int64{
+				StructuredMetadataBytes: map[time.Duration]int64{
 					time.Hour: 0,
 				},
-				streamLabelsSize:         27,
-				mostRecentEntryTimestamp: now,
+				ResourceAndSourceMetadataLabels: map[time.Duration]push.LabelsAdapter{
+					time.Hour: nil,
+				},
+				StreamLabelsSize:         27,
+				MostRecentEntryTimestamp: now,
 			},
 		},
 		{
 			name:       "service.name not defined in resource attributes",
-			otlpConfig: DefaultOTLPConfig,
+			otlpConfig: DefaultOTLPConfig(defaultGlobalOTLPConfig),
 			generateLogs: func() plog.Logs {
 				ld := plog.NewLogs()
 				ld.ResourceLogs().AppendEmpty().Resource().Attributes().PutStr("service.namespace", "foo")
@@ -143,20 +170,23 @@ func TestOTLPToLokiPushRequest(t *testing.T) {
 				},
 			},
 			expectedStats: Stats{
-				numLines: 1,
-				logLinesBytes: map[time.Duration]int64{
+				NumLines: 1,
+				LogLinesBytes: map[time.Duration]int64{
 					time.Hour: 9,
 				},
-				structuredMetadataBytes: map[time.Duration]int64{
+				StructuredMetadataBytes: map[time.Duration]int64{
 					time.Hour: 0,
 				},
-				streamLabelsSize:         47,
-				mostRecentEntryTimestamp: now,
+				ResourceAndSourceMetadataLabels: map[time.Duration]push.LabelsAdapter{
+					time.Hour: nil,
+				},
+				StreamLabelsSize:         47,
+				MostRecentEntryTimestamp: now,
 			},
 		},
 		{
 			name:       "resource attributes and scope attributes stored as structured metadata",
-			otlpConfig: DefaultOTLPConfig,
+			otlpConfig: DefaultOTLPConfig(defaultGlobalOTLPConfig),
 			generateLogs: func() plog.Logs {
 				ld := plog.NewLogs()
 				ld.ResourceLogs().AppendEmpty()
@@ -218,20 +248,27 @@ func TestOTLPToLokiPushRequest(t *testing.T) {
 				},
 			},
 			expectedStats: Stats{
-				numLines: 2,
-				logLinesBytes: map[time.Duration]int64{
+				NumLines: 2,
+				LogLinesBytes: map[time.Duration]int64{
 					time.Hour: 26,
 				},
-				structuredMetadataBytes: map[time.Duration]int64{
+				StructuredMetadataBytes: map[time.Duration]int64{
 					time.Hour: 37,
 				},
-				streamLabelsSize:         21,
-				mostRecentEntryTimestamp: now,
+				ResourceAndSourceMetadataLabels: map[time.Duration]push.LabelsAdapter{
+					time.Hour: []push.LabelAdapter{
+						{Name: "service_image", Value: "loki"},
+						{Name: "op", Value: "buzz"},
+						{Name: "scope_name", Value: "fizz"},
+					},
+				},
+				StreamLabelsSize:         21,
+				MostRecentEntryTimestamp: now,
 			},
 		},
 		{
 			name:       "attributes with nested data",
-			otlpConfig: DefaultOTLPConfig,
+			otlpConfig: DefaultOTLPConfig(defaultGlobalOTLPConfig),
 			generateLogs: func() plog.Logs {
 				ld := plog.NewLogs()
 				ld.ResourceLogs().AppendEmpty()
@@ -302,15 +339,22 @@ func TestOTLPToLokiPushRequest(t *testing.T) {
 				},
 			},
 			expectedStats: Stats{
-				numLines: 2,
-				logLinesBytes: map[time.Duration]int64{
+				NumLines: 2,
+				LogLinesBytes: map[time.Duration]int64{
 					time.Hour: 26,
 				},
-				structuredMetadataBytes: map[time.Duration]int64{
+				StructuredMetadataBytes: map[time.Duration]int64{
 					time.Hour: 97,
 				},
-				streamLabelsSize:         21,
-				mostRecentEntryTimestamp: now,
+				ResourceAndSourceMetadataLabels: map[time.Duration]push.LabelsAdapter{
+					time.Hour: []push.LabelAdapter{
+						{Name: "resource_nested_foo", Value: "bar"},
+						{Name: "scope_nested_foo", Value: "bar"},
+						{Name: "scope_name", Value: "fizz"},
+					},
+				},
+				StreamLabelsSize:         21,
+				MostRecentEntryTimestamp: now,
 			},
 		},
 		{
@@ -321,7 +365,8 @@ func TestOTLPToLokiPushRequest(t *testing.T) {
 						{
 							Action:     IndexLabel,
 							Attributes: []string{"pod.name"},
-						}, {
+						},
+						{
 							Action: IndexLabel,
 							Regex:  relabel.MustNewRegexp("service.*"),
 						},
@@ -445,23 +490,52 @@ func TestOTLPToLokiPushRequest(t *testing.T) {
 				},
 			},
 			expectedStats: Stats{
-				numLines: 2,
-				logLinesBytes: map[time.Duration]int64{
+				NumLines: 2,
+				LogLinesBytes: map[time.Duration]int64{
 					time.Hour: 26,
 				},
-				structuredMetadataBytes: map[time.Duration]int64{
+				StructuredMetadataBytes: map[time.Duration]int64{
 					time.Hour: 113,
 				},
-				streamLabelsSize:         42,
-				mostRecentEntryTimestamp: now,
+				ResourceAndSourceMetadataLabels: map[time.Duration]push.LabelsAdapter{
+					time.Hour: []push.LabelAdapter{
+						{Name: "pod_ip", Value: "10.200.200.200"},
+						{Name: "resource_nested_foo", Value: "bar"},
+						{Name: "scope_nested_foo", Value: "bar"},
+						{Name: "scope_name", Value: "fizz"},
+					},
+				},
+				StreamLabelsSize:         42,
+				MostRecentEntryTimestamp: now,
 			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stats := newPushStats()
-			pushReq := otlpToLokiPushRequest(tc.generateLogs(), "foo", fakeRetention{}, tc.otlpConfig, stats)
+			tracker := NewMockTracker()
+			pushReq := otlpToLokiPushRequest(
+				context.Background(),
+				tc.generateLogs(),
+				"foo",
+				fakeRetention{},
+				tc.otlpConfig,
+				defaultServiceDetection,
+				tracker,
+				stats,
+				false,
+				log.NewNopLogger(),
+			)
 			require.Equal(t, tc.expectedPushRequest, *pushReq)
 			require.Equal(t, tc.expectedStats, *stats)
+
+			totalBytes := 0.0
+			for _, b := range stats.LogLinesBytes {
+				totalBytes += float64(b)
+			}
+			for _, b := range stats.StructuredMetadataBytes {
+				totalBytes += float64(b)
+			}
+			require.Equal(t, totalBytes, tracker.Total(), "Total tracked bytes must equal total bytes of the stats.")
 		})
 	}
 }
@@ -546,10 +620,9 @@ func TestOTLPLogToPushEntry(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.expectedResp, otlpLogToPushEntry(tc.buildLogRecord(), DefaultOTLPConfig))
+			require.Equal(t, tc.expectedResp, otlpLogToPushEntry(tc.buildLogRecord(), DefaultOTLPConfig(defaultGlobalOTLPConfig)))
 		})
 	}
-
 }
 
 func TestAttributesToLabels(t *testing.T) {
@@ -663,4 +736,42 @@ type fakeRetention struct{}
 
 func (f fakeRetention) RetentionPeriodFor(_ string, _ labels.Labels) time.Duration {
 	return time.Hour
+}
+
+func TestOtlpError(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		msg          string
+		inCode       int
+		expectedCode int
+	}{
+		{
+			name:         "500 error maps 503",
+			msg:          "test error 500 to 503",
+			inCode:       http.StatusInternalServerError,
+			expectedCode: http.StatusServiceUnavailable,
+		},
+		{
+			name:         "other error",
+			msg:          "test error",
+			inCode:       http.StatusForbidden,
+			expectedCode: http.StatusForbidden,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := log.NewNopLogger()
+
+			r := httptest.NewRecorder()
+			OTLPError(r, tc.msg, tc.inCode, logger)
+
+			require.Equal(t, tc.expectedCode, r.Code)
+			require.Equal(t, "application/octet-stream", r.Header().Get("Content-Type"))
+
+			respStatus := &status.Status{}
+			require.NoError(t, proto.Unmarshal(r.Body.Bytes(), respStatus))
+
+			require.Equal(t, tc.msg, respStatus.Message)
+			require.EqualValues(t, 0, respStatus.Code)
+		})
+	}
 }

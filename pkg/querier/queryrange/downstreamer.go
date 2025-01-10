@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"time"
 
-	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/concurrency"
 	"github.com/grafana/dskit/tenant"
 	"github.com/opentracing/opentracing-go"
@@ -13,11 +13,11 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 
-	"github.com/grafana/loki/pkg/logql"
-	"github.com/grafana/loki/pkg/logqlmodel"
-	"github.com/grafana/loki/pkg/querier/plan"
-	"github.com/grafana/loki/pkg/querier/queryrange/queryrangebase"
-	"github.com/grafana/loki/pkg/util/spanlogger"
+	"github.com/grafana/loki/v3/pkg/logql"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
+	"github.com/grafana/loki/v3/pkg/querier/plan"
+	"github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
 )
 
 const (
@@ -27,6 +27,8 @@ const (
 type DownstreamHandler struct {
 	limits Limits
 	next   queryrangebase.Handler
+
+	splitAlign bool
 }
 
 func ParamsToLokiRequest(params logql.Params) queryrangebase.Request {
@@ -41,6 +43,8 @@ func ParamsToLokiRequest(params logql.Params) queryrangebase.Request {
 			Plan: &plan.QueryPlan{
 				AST: params.GetExpression(),
 			},
+			StoreChunks:    params.GetStoreChunks(),
+			CachingOptions: params.CachingOptions(),
 		}
 	}
 	return &LokiRequest{
@@ -56,6 +60,8 @@ func ParamsToLokiRequest(params logql.Params) queryrangebase.Request {
 		Plan: &plan.QueryPlan{
 			AST: params.GetExpression(),
 		},
+		StoreChunks:    params.GetStoreChunks(),
+		CachingOptions: params.CachingOptions(),
 	}
 }
 
@@ -86,6 +92,7 @@ func (h DownstreamHandler) Downstreamer(ctx context.Context) logql.Downstreamer 
 		parallelism: p,
 		locks:       locks,
 		handler:     h.next,
+		splitAlign:  h.splitAlign,
 	}
 }
 
@@ -94,16 +101,48 @@ type instance struct {
 	parallelism int
 	locks       chan struct{}
 	handler     queryrangebase.Handler
+
+	splitAlign bool
+}
+
+// withoutOffset returns the given query string with offsets removed and timestamp adjusted accordingly. If no offset is present in original query, it will be returned as is.
+func withoutOffset(query logql.DownstreamQuery) (string, time.Time, time.Time) {
+	expr := query.Params.GetExpression()
+
+	var (
+		newStart = query.Params.Start()
+		newEnd   = query.Params.End()
+	)
+	expr.Walk(func(e syntax.Expr) {
+		switch rng := e.(type) {
+		case *syntax.RangeAggregationExpr:
+			off := rng.Left.Offset
+
+			if off != 0 {
+				rng.Left.Offset = 0 // remove offset
+
+				// adjust start and end time
+				newEnd = newEnd.Add(-off)
+				newStart = newStart.Add(-off)
+
+			}
+		}
+	})
+	return expr.String(), newStart, newEnd
 }
 
 func (in instance) Downstream(ctx context.Context, queries []logql.DownstreamQuery, acc logql.Accumulator) ([]logqlmodel.Result, error) {
 	return in.For(ctx, queries, acc, func(qry logql.DownstreamQuery) (logqlmodel.Result, error) {
-		req := ParamsToLokiRequest(qry.Params).WithQuery(qry.Params.GetExpression().String())
+		var req queryrangebase.Request
+		if in.splitAlign {
+			qs, newStart, newEnd := withoutOffset(qry)
+			req = ParamsToLokiRequest(qry.Params).WithQuery(qs).WithStartEnd(newStart, newEnd)
+		} else {
+			req = ParamsToLokiRequest(qry.Params).WithQuery(qry.Params.GetExpression().String())
+		}
 		sp, ctx := opentracing.StartSpanFromContext(ctx, "DownstreamHandler.instance")
 		defer sp.Finish()
-		logger := spanlogger.FromContext(ctx)
-		defer logger.Finish()
-		level.Debug(logger).Log("shards", fmt.Sprintf("%+v", qry.Params.Shards()), "query", req.GetQuery(), "step", req.GetStep(), "handler", reflect.TypeOf(in.handler))
+		sp.LogKV("shards", fmt.Sprintf("%+v", qry.Params.Shards()), "query", req.GetQuery(), "start", req.GetStart(), "end", req.GetEnd(), "step", req.GetStep(), "handler", reflect.TypeOf(in.handler), "engine", "downstream")
 
 		res, err := in.handler.Do(ctx, req)
 		if err != nil {
@@ -131,10 +170,12 @@ func (in instance) For(
 	go func() {
 		err := concurrency.ForEachJob(ctx, len(queries), in.parallelism, func(ctx context.Context, i int) error {
 			res, err := fn(queries[i])
+			if err != nil {
+				return err
+			}
 			response := logql.Resp{
 				I:   i,
 				Res: res,
-				Err: err,
 			}
 
 			// Feed the result into the channel unless the work has completed.
@@ -142,7 +183,7 @@ func (in instance) For(
 			case <-ctx.Done():
 			case ch <- response:
 			}
-			return err
+			return nil
 		})
 		if err != nil {
 			ch <- logql.Resp{
@@ -153,15 +194,19 @@ func (in instance) For(
 		close(ch)
 	}()
 
+	var err error
 	for resp := range ch {
+		if err != nil {
+			continue
+		}
 		if resp.Err != nil {
-			return nil, resp.Err
+			err = resp.Err
+			continue
 		}
-		if err := acc.Accumulate(ctx, resp.Res, resp.I); err != nil {
-			return nil, err
-		}
+		err = acc.Accumulate(ctx, resp.Res, resp.I)
 	}
-	return acc.Result(), nil
+
+	return acc.Result(), err
 }
 
 // convert to matrix

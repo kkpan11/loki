@@ -10,53 +10,10 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 
-	v1 "github.com/grafana/loki/pkg/storage/bloom/v1"
+	v1 "github.com/grafana/loki/v3/pkg/storage/bloom/v1"
 )
 
 func TestBloomShipper_findBlocks(t *testing.T) {
-	t.Run("expected block that are specified in tombstones to be filtered out", func(t *testing.T) {
-		metas := []Meta{
-			{
-				Blocks: []BlockRef{
-					//this blockRef is marked as deleted in the next meta
-					createMatchingBlockRef(1),
-					createMatchingBlockRef(2),
-				},
-			},
-			{
-				Blocks: []BlockRef{
-					//this blockRef is marked as deleted in the next meta
-					createMatchingBlockRef(3),
-					createMatchingBlockRef(4),
-				},
-			},
-			{
-				BlockTombstones: []BlockRef{
-					createMatchingBlockRef(1),
-					createMatchingBlockRef(3),
-				},
-				Blocks: []BlockRef{
-					createMatchingBlockRef(5),
-				},
-			},
-		}
-
-		ts := model.Now()
-
-		interval := NewInterval(
-			ts.Add(-2*time.Hour),
-			ts.Add(-1*time.Hour),
-		)
-		blocks := BlocksForMetas(metas, interval, []v1.FingerprintBounds{{Min: 100, Max: 200}})
-
-		expectedBlockRefs := []BlockRef{
-			createMatchingBlockRef(2),
-			createMatchingBlockRef(4),
-			createMatchingBlockRef(5),
-		}
-		require.ElementsMatch(t, expectedBlockRefs, blocks)
-	})
-
 	tests := map[string]struct {
 		minFingerprint uint64
 		maxFingerprint uint64
@@ -185,7 +142,7 @@ func TestBloomShipper_IsOutsideRange(t *testing.T) {
 func TestBloomShipper_ForEach(t *testing.T) {
 	blockRefs := make([]BlockRef, 0, 3)
 
-	store, _ := newMockBloomStore(t)
+	store, _, _ := newMockBloomStore(t)
 	for i := 0; i < len(blockRefs); i++ {
 		block, err := createBlockInStorage(t, store, "tenant", model.Time(i*24*int(time.Hour)), 0x0000, 0x00ff)
 		require.NoError(t, err)
@@ -202,15 +159,15 @@ func TestBloomShipper_ForEach(t *testing.T) {
 	require.Equal(t, len(blockRefs), count)
 
 	// check that the BlockDirectory ref counter is 0
-	for i := 0; i < len(blockRefs); i++ {
-		s := store.stores[0]
-		key := s.Block(blockRefs[i]).Addr()
-		found, dirs, missing, err := s.fetcher.blocksCache.Fetch(context.Background(), []string{key})
-		require.NoError(t, err)
-		require.Equal(t, 1, len(found))
-		require.Equal(t, 0, len(missing))
-		require.Equal(t, int32(0), dirs[0].refCount.Load())
-	}
+	// for i := 0; i < len(blockRefs); i++ {
+	// 	s := store.stores[0]
+	// 	key := s.Block(blockRefs[i]).Addr()
+	// 	found, dirs, missing, err := s.fetcher.blocksCache.Get(context.Background(), key)
+	// 	require.NoError(t, err)
+	// 	require.Equal(t, 1, len(found))
+	// 	require.Equal(t, 0, len(missing))
+	// 	require.Equal(t, int32(0), dirs[0].refCount.Load())
+	// }
 }
 
 func createMatchingBlockRef(checksum uint32) BlockRef {

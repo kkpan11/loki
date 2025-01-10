@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	v1 "github.com/grafana/loki/pkg/storage/bloom/v1"
+	v1 "github.com/grafana/loki/v3/pkg/storage/bloom/v1"
 )
 
 type ForEachBlockCallback func(bq *v1.BlockQuerier, bounds v1.FingerprintBounds) error
@@ -16,21 +16,17 @@ type Interface interface {
 }
 
 type Shipper struct {
-	store Store
+	store StoreBase
 }
 
-type Limits interface {
-	BloomGatewayBlocksDownloadingParallelism(tenantID string) int
-}
-
-func NewShipper(client Store) *Shipper {
+func NewShipper(client StoreBase) *Shipper {
 	return &Shipper{store: client}
 }
 
 // ForEach is a convenience function that wraps the store's FetchBlocks function
 // and automatically closes the block querier once the callback was run.
 func (s *Shipper) ForEach(ctx context.Context, refs []BlockRef, callback ForEachBlockCallback) error {
-	bqs, err := s.store.FetchBlocks(ctx, refs)
+	bqs, err := s.store.FetchBlocks(ctx, refs, WithFetchAsync(false))
 	if err != nil {
 		return err
 	}
@@ -55,30 +51,15 @@ func (s *Shipper) Stop() {
 }
 
 // BlocksForMetas returns all the blocks from all the metas listed that are within the requested bounds
-// and not tombstoned in any of the metas
-func BlocksForMetas(metas []Meta, interval Interval, keyspaces []v1.FingerprintBounds) []BlockRef {
-	blocks := make(map[BlockRef]bool) // block -> isTombstoned
-
+func BlocksForMetas(metas []Meta, interval Interval, keyspaces []v1.FingerprintBounds) (refs []BlockRef) {
 	for _, meta := range metas {
-		for _, tombstone := range meta.BlockTombstones {
-			blocks[tombstone] = true
-		}
 		for _, block := range meta.Blocks {
-			tombstoned, ok := blocks[block]
-			if ok && tombstoned {
-				// skip tombstoned blocks
-				continue
+			if !isOutsideRange(block, interval, keyspaces) {
+				refs = append(refs, block)
 			}
-			blocks[block] = false
 		}
 	}
 
-	refs := make([]BlockRef, 0, len(blocks))
-	for ref, tombstoned := range blocks {
-		if !tombstoned && !isOutsideRange(ref, interval, keyspaces) {
-			refs = append(refs, ref)
-		}
-	}
 	sort.Slice(refs, func(i, j int) bool {
 		return refs[i].Bounds.Less(refs[j].Bounds)
 	})
