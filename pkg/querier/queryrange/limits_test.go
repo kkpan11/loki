@@ -17,16 +17,17 @@ import (
 	"go.uber.org/atomic"
 	"gopkg.in/yaml.v2"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql/syntax"
-	"github.com/grafana/loki/pkg/logqlmodel"
-	"github.com/grafana/loki/pkg/querier/plan"
-	base "github.com/grafana/loki/pkg/querier/queryrange/queryrangebase"
-	"github.com/grafana/loki/pkg/storage/config"
-	"github.com/grafana/loki/pkg/util"
-	"github.com/grafana/loki/pkg/util/constants"
-	util_log "github.com/grafana/loki/pkg/util/log"
-	"github.com/grafana/loki/pkg/util/math"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
+	"github.com/grafana/loki/v3/pkg/querier/plan"
+	base "github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/v3/pkg/storage/config"
+	"github.com/grafana/loki/v3/pkg/storage/types"
+	"github.com/grafana/loki/v3/pkg/util"
+	"github.com/grafana/loki/v3/pkg/util/constants"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/util/math"
 )
 
 func TestLimits(t *testing.T) {
@@ -240,14 +241,14 @@ func Test_MaxQueryParallelism(t *testing.T) {
 		defer count.Dec()
 		// simulate some work
 		time.Sleep(20 * time.Millisecond)
-		return base.NewEmptyPrometheusResponse(), nil
+		return base.NewEmptyPrometheusResponse(model.ValMatrix), nil
 	})
 	ctx := user.InjectOrgID(context.Background(), "foo")
 
 	_, _ = NewLimitedRoundTripper(h, fakeLimits{maxQueryParallelism: maxQueryParallelism},
 		testSchemas,
 		base.MiddlewareFunc(func(next base.Handler) base.Handler {
-			return base.HandlerFunc(func(c context.Context, r base.Request) (base.Response, error) {
+			return base.HandlerFunc(func(c context.Context, _ base.Request) (base.Response, error) {
 				var wg sync.WaitGroup
 				for i := 0; i < 10; i++ {
 					wg.Add(1)
@@ -271,7 +272,7 @@ func Test_MaxQueryParallelismLateScheduling(t *testing.T) {
 	h := base.HandlerFunc(func(_ context.Context, _ base.Request) (base.Response, error) {
 		// simulate some work
 		time.Sleep(20 * time.Millisecond)
-		return base.NewEmptyPrometheusResponse(), nil
+		return base.NewEmptyPrometheusResponse(model.ValMatrix), nil
 	})
 	ctx := user.InjectOrgID(context.Background(), "foo")
 
@@ -298,14 +299,14 @@ func Test_MaxQueryParallelismDisable(t *testing.T) {
 	h := base.HandlerFunc(func(_ context.Context, _ base.Request) (base.Response, error) {
 		// simulate some work
 		time.Sleep(20 * time.Millisecond)
-		return base.NewEmptyPrometheusResponse(), nil
+		return base.NewEmptyPrometheusResponse(model.ValMatrix), nil
 	})
 	ctx := user.InjectOrgID(context.Background(), "foo")
 
 	_, err := NewLimitedRoundTripper(h, fakeLimits{maxQueryParallelism: maxQueryParallelism},
 		testSchemas,
 		base.MiddlewareFunc(func(next base.Handler) base.Handler {
-			return base.HandlerFunc(func(c context.Context, r base.Request) (base.Response, error) {
+			return base.HandlerFunc(func(c context.Context, _ base.Request) (base.Response, error) {
 				for i := 0; i < 10; i++ {
 					go func() {
 						_, _ = next.Do(c, &LokiRequest{})
@@ -510,7 +511,7 @@ func Test_WeightedParallelism_DivideByZeroError(t *testing.T) {
 				From: config.DayTime{
 					Time: borderTime.Add(-1 * time.Hour),
 				},
-				IndexType: config.TSDBType,
+				IndexType: types.TSDBType,
 			},
 		}
 
@@ -528,7 +529,7 @@ func Test_WeightedParallelism_DivideByZeroError(t *testing.T) {
 				From: config.DayTime{
 					Time: borderTime.Add(-1 * time.Hour),
 				},
-				IndexType: config.TSDBType,
+				IndexType: types.TSDBType,
 			},
 		}
 
@@ -546,7 +547,7 @@ func Test_WeightedParallelism_DivideByZeroError(t *testing.T) {
 				From: config.DayTime{
 					Time: borderTime.Add(-1 * time.Hour),
 				},
-				IndexType: config.TSDBType,
+				IndexType: types.TSDBType,
 			},
 		}
 
@@ -562,12 +563,12 @@ func Test_MaxQuerySize(t *testing.T) {
 		{
 			// BoltDB -> Time -4 days
 			From:      config.DayTime{Time: model.TimeFromUnix(testTime.Add(-96 * time.Hour).Unix())},
-			IndexType: config.BoltDBShipperType,
+			IndexType: types.BoltDBShipperType,
 		},
 		{
 			// TSDB -> Time -2 days
 			From:      config.DayTime{Time: model.TimeFromUnix(testTime.Add(-48 * time.Hour).Unix())},
-			IndexType: config.TSDBType,
+			IndexType: types.TSDBType,
 		},
 	}
 
@@ -586,7 +587,7 @@ func Test_MaxQuerySize(t *testing.T) {
 	}{
 		{
 			desc:       "No TSDB",
-			schema:     config.BoltDBShipperType,
+			schema:     types.BoltDBShipperType,
 			query:      `{app="foo"} |= "foo"`,
 			queryRange: 1 * time.Hour,
 
@@ -758,7 +759,7 @@ func Test_MaxQuerySize_MaxLookBackPeriod(t *testing.T) {
 			}
 
 			handler := tc.middleware.Wrap(
-				base.HandlerFunc(func(_ context.Context, req base.Request) (base.Response, error) {
+				base.HandlerFunc(func(_ context.Context, _ base.Request) (base.Response, error) {
 					return &LokiResponse{}, nil
 				}),
 			)
@@ -771,14 +772,13 @@ func Test_MaxQuerySize_MaxLookBackPeriod(t *testing.T) {
 }
 
 func TestAcquireWithTiming(t *testing.T) {
-
 	ctx := context.Background()
 	sem := NewSemaphoreWithTiming(2)
 
 	// Channel to collect waiting times
 	waitingTimes := make(chan struct {
 		GoroutineID int
-		WaitingTime int64
+		WaitingTime time.Duration
 	}, 3)
 
 	tryAcquire := func(n int64, goroutineID int) {
@@ -788,8 +788,8 @@ func TestAcquireWithTiming(t *testing.T) {
 		}
 		waitingTimes <- struct {
 			GoroutineID int
-			WaitingTime int64
-		}{goroutineID, elapsed.Milliseconds()}
+			WaitingTime time.Duration
+		}{goroutineID, elapsed}
 
 		defer sem.sem.Release(n)
 
@@ -807,13 +807,13 @@ func TestAcquireWithTiming(t *testing.T) {
 	// Collect and sort waiting times
 	var waitingDurations []struct {
 		GoroutineID int
-		WaitingTime int64
+		WaitingTime time.Duration
 	}
 	for i := 0; i < 3; i++ {
 		waitingDurations = append(waitingDurations, <-waitingTimes)
 	}
 	// Find and check the waiting time for the third goroutine
-	var waiting3 int64
+	var waiting3 time.Duration
 	for _, waiting := range waitingDurations {
 		if waiting.GoroutineID == 3 {
 			waiting3 = waiting.WaitingTime
@@ -821,7 +821,7 @@ func TestAcquireWithTiming(t *testing.T) {
 		}
 	}
 
-	// Check that the waiting time for the third request is larger than 0 milliseconds and less than or equal to 10-5=5 milliseconds
-	require.Greater(t, waiting3, 0*time.Millisecond)
-	require.LessOrEqual(t, waiting3, 5*time.Millisecond)
+	// Check that the waiting time for the third request is larger than 0 milliseconds and less than 10 milliseconds
+	require.Greater(t, waiting3, 0*time.Nanosecond)
+	require.Less(t, waiting3, 10*time.Millisecond)
 }

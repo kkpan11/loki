@@ -8,8 +8,8 @@ import (
 	"github.com/grafana/dskit/tenant"
 	"github.com/pkg/errors"
 
-	"github.com/grafana/loki/pkg/compactor/client/grpc"
-	util_log "github.com/grafana/loki/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/compactor/client/grpc"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 type GRPCRequestHandler struct {
@@ -45,8 +45,7 @@ func (g *GRPCRequestHandler) GetDeleteRequests(ctx context.Context, _ *grpc.GetD
 		return nil, err
 	}
 
-	deletesPerRequest := partitionByRequestID(deleteGroups)
-	deleteRequests := mergeDeletes(deletesPerRequest)
+	deleteRequests := mergeDeletes(deleteGroups)
 
 	sort.Slice(deleteRequests, func(i, j int) bool {
 		return deleteRequests[i].CreatedAt < deleteRequests[j].CreatedAt

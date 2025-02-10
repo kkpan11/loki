@@ -8,7 +8,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/prometheus/prometheus/model/labels"
 
-	"github.com/grafana/loki/pkg/logql/log"
+	"github.com/grafana/loki/v3/pkg/logql/log"
 )
 
 type JSONSerializer struct {
@@ -69,6 +69,7 @@ const (
 	RHS                 = "rhs"
 	Src                 = "src"
 	StringField         = "string"
+	NoopField           = "noop"
 	Type                = "type"
 	Unwrap              = "unwrap"
 	Value               = "value"
@@ -203,7 +204,7 @@ func (v *JSONSerializer) VisitRangeAggregation(e *RangeAggregationExpr) {
 	v.Flush()
 }
 
-func (v *JSONSerializer) VisitLogRange(e *LogRange) {
+func (v *JSONSerializer) VisitLogRange(e *LogRangeExpr) {
 	v.WriteObjectStart()
 
 	v.WriteObjectField(IntervalNanos)
@@ -305,17 +306,17 @@ func (v *JSONSerializer) VisitPipeline(e *PipelineExpr) {
 
 // Below are StageExpr visitors that we are skipping since a pipeline is
 // serialized as a string.
-func (*JSONSerializer) VisitDecolorize(*DecolorizeExpr)                     {}
-func (*JSONSerializer) VisitDropLabels(*DropLabelsExpr)                     {}
-func (*JSONSerializer) VisitJSONExpressionParser(*JSONExpressionParser)     {}
-func (*JSONSerializer) VisitKeepLabel(*KeepLabelsExpr)                      {}
-func (*JSONSerializer) VisitLabelFilter(*LabelFilterExpr)                   {}
-func (*JSONSerializer) VisitLabelFmt(*LabelFmtExpr)                         {}
-func (*JSONSerializer) VisitLabelParser(*LabelParserExpr)                   {}
-func (*JSONSerializer) VisitLineFilter(*LineFilterExpr)                     {}
-func (*JSONSerializer) VisitLineFmt(*LineFmtExpr)                           {}
-func (*JSONSerializer) VisitLogfmtExpressionParser(*LogfmtExpressionParser) {}
-func (*JSONSerializer) VisitLogfmtParser(*LogfmtParserExpr)                 {}
+func (*JSONSerializer) VisitDecolorize(*DecolorizeExpr)                         {}
+func (*JSONSerializer) VisitDropLabels(*DropLabelsExpr)                         {}
+func (*JSONSerializer) VisitJSONExpressionParser(*JSONExpressionParserExpr)     {}
+func (*JSONSerializer) VisitKeepLabel(*KeepLabelsExpr)                          {}
+func (*JSONSerializer) VisitLabelFilter(*LabelFilterExpr)                       {}
+func (*JSONSerializer) VisitLabelFmt(*LabelFmtExpr)                             {}
+func (*JSONSerializer) VisitLabelParser(*LineParserExpr)                        {}
+func (*JSONSerializer) VisitLineFilter(*LineFilterExpr)                         {}
+func (*JSONSerializer) VisitLineFmt(*LineFmtExpr)                               {}
+func (*JSONSerializer) VisitLogfmtExpressionParser(*LogfmtExpressionParserExpr) {}
+func (*JSONSerializer) VisitLogfmtParser(*LogfmtParserExpr)                     {}
 
 func encodeGrouping(s *jsoniter.Stream, g *Grouping) {
 	s.WriteObjectStart()
@@ -415,8 +416,26 @@ func encodeLabelFilter(s *jsoniter.Stream, filter log.LabelFilterer) {
 		s.WriteObjectEnd()
 
 		s.WriteObjectEnd()
-	case log.NoopLabelFilter:
-		return
+	case *log.NoopLabelFilter:
+		s.WriteObjectStart()
+		s.WriteObjectField(NoopField)
+
+		s.WriteObjectStart()
+		if concrete.Matcher != nil {
+			s.WriteObjectField(Name)
+			s.WriteString(concrete.Name)
+
+			s.WriteMore()
+			s.WriteObjectField(Value)
+			s.WriteString(concrete.Value)
+
+			s.WriteMore()
+			s.WriteObjectField(Type)
+			s.WriteInt(int(concrete.Type))
+		}
+		s.WriteObjectEnd()
+
+		s.WriteObjectEnd()
 	case *log.BytesLabelFilter:
 		s.WriteObjectStart()
 		s.WriteObjectField(Bytes)
@@ -606,8 +625,7 @@ func decodeLabelFilter(iter *jsoniter.Iterator) log.LabelFilterer {
 			}
 
 			filter = log.NewNumericLabelFilter(t, name, value)
-		case StringField:
-
+		case StringField, NoopField:
 			var name string
 			var value string
 			var t labels.MatchType
@@ -840,8 +858,8 @@ func decodeRangeAgg(iter *jsoniter.Iterator) (*RangeAggregationExpr, error) {
 	return expr, err
 }
 
-func decodeLogRange(iter *jsoniter.Iterator) (*LogRange, error) {
-	expr := &LogRange{}
+func decodeLogRange(iter *jsoniter.Iterator) (*LogRangeExpr, error) {
+	expr := &LogRangeExpr{}
 	var err error
 
 	for f := iter.ReadObject(); f != ""; f = iter.ReadObject() {
